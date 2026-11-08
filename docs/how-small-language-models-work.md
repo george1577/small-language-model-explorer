@@ -635,7 +635,7 @@ sequenceDiagram
     D->>T: here are my 3 guesses
     T->>T: ONE pass over all 3 positions
     Note over T: my picks: " the" ✓, " south" ✗ (draft said " central")
-    T-->>D: keep " the", then add my " south"; discard " part"
+    T-->>D: keep " the", then add my " south", discard " part"
     Note over D,T: Text so far: "... located in the south" (2 tokens for 1 target pass)
 ```
 
