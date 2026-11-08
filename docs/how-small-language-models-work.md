@@ -244,8 +244,8 @@ version teaches much more per question.
 
 Language models train the same way. At each position in the training text:
 
-- The **hard label** is the token that actually comes next. Normal training pushes the model to
-  give it 100%.
+- The **hard label** is the token that actually comes next in the training text (not the
+  teacher's prediction). Normal training pushes the model to give it 100%.
 - The **soft label** is the teacher's whole probability list for that position, including how much
   it likes the *wrong-but-plausible* tokens. That extra information is sometimes called *dark
   knowledge*.
@@ -287,7 +287,7 @@ distillation loss = T² × KL( teacher at temperature T  ‖  student at tempera
   student gives it 50%, the loss is −log(0.5) = 0.69; at 99% it is 0.01; at 1.7% it is 4.06.
 - **KL divergence** measures how different two probability lists are. It is 0 when they are
   identical and grows as they disagree, especially where the teacher puts probability but the student
-  doesn't. Appendix A works one out by hand.
+  doesn't. Appendix A works one out by hand, including a full example that starts from logits.
 - **T²**: softening with temperature makes the student's corrections (the gradients) roughly T²
   times weaker. Multiplying by T² puts them back to their normal size, so changing T doesn't
   secretly change how much the distillation term counts.
@@ -781,6 +781,83 @@ KL = 0.7 × ln(0.7/0.5)  +  0.2 × ln(0.2/0.3)  +  0.1 × ln(0.1/0.2)
 **Why T²?** Dividing logits by T makes both distributions flatter and closer together, and the
 student's gradients from the KL term come out roughly 1/T² as large. Multiplying by T² restores their
 size, so you can change T without re-tuning α.
+
+### A full example, starting from logits
+
+The example above starts from probabilities that are already softened. Here is the whole calculation
+from raw logits, the way `slm_lab/distillation.py` does it. Note that the task loss uses the
+student at **T = 1**, while the distillation loss softens **both** models with T.
+
+The training text is `for i in range(10):`. The context so far is `for i in`, so the **hard label**
+is `range`. It comes from the training text, not from the teacher. Vocabulary of 4 tokens:
+
+| index | token | teacher logit | student logit |
+|---|---|---|---|
+| 0 | `range` (hard label) | 4.0 | 2.0 |
+| 1 | `enumerate` | 3.0 | 1.0 |
+| 2 | `list` | 1.0 | 1.5 |
+| 3 | `x` | 0.0 | 0.0 |
+
+As a one-hot vector the hard label is `y = [1, 0, 0, 0]`.
+
+**Step 1: task loss = CE(student, hard label).** Softmax of the student's logits at T = 1,
+`p_i = e^(z_i) / Σ_j e^(z_j)`:
+
+```
+e^2.0 = 7.3891    e^1.0 = 2.7183    e^1.5 = 4.4817    e^0 = 1.0
+sum   = 7.3891 + 2.7183 + 4.4817 + 1.0 = 15.589
+
+p_student = [7.3891/15.589, 2.7183/15.589, 4.4817/15.589, 1.0/15.589]
+          = [0.4740, 0.1744, 0.2875, 0.0641]
+
+task loss = −Σ y_i × ln(p_i)
+          = −(1 × ln 0.4740  +  0 × ln 0.1744  +  0 × ln 0.2875  +  0 × ln 0.0641)
+          = −ln 0.4740
+          = 0.7466
+```
+
+Only the probability of `range` counts. The task loss can't tell that `enumerate` was a reasonable
+guess and `x` was not.
+
+**Step 2: soften both models with T = 2.** Divide the logits by 2, then apply softmax.
+
+```
+teacher logits / 2 = [2.0, 1.5, 0.5, 0.0]
+e^2.0 = 7.3891    e^1.5 = 4.4817    e^0.5 = 1.6487    e^0 = 1.0      sum = 14.5195
+p (teacher, T=2) = [0.5089, 0.3087, 0.1136, 0.0689]
+
+student logits / 2 = [1.0, 0.5, 0.75, 0.0]
+e^1.0 = 2.7183    e^0.5 = 1.6487    e^0.75 = 2.1170   e^0 = 1.0      sum = 7.4840
+q (student, T=2) = [0.3632, 0.2203, 0.2829, 0.1336]
+```
+
+At T = 1 the teacher's distribution would be `[0.696, 0.256, 0.035, 0.013]`. At T = 2 the small
+probabilities grow, so they carry more weight in the KL.
+
+**Step 3: KL(p ‖ q) = Σ p_i × ln(p_i / q_i).**
+
+```
+range:      0.5089 × ln(0.5089 / 0.3632)  =  +0.1716
+enumerate:  0.3087 × ln(0.3087 / 0.2203)  =  +0.1041
+list:       0.1136 × ln(0.1136 / 0.2829)  =  −0.1036
+x:          0.0689 × ln(0.0689 / 0.1336)  =  −0.0456
+                                    KL    =   0.1265
+```
+
+**Step 4: distillation loss = T² × KL** = `2² × 0.1265 = 0.5059`.
+
+This term looks at every token. It penalizes the student for giving `list` too much probability
+(0.28 vs the teacher's 0.11) and `enumerate` too little. That is the information the hard label
+throws away.
+
+**Step 5: combined loss with α = 0.5:**
+
+```
+loss = (1 − α) × task loss  +  α × distillation loss
+     = 0.5 × 0.7466         +  0.5 × 0.5059
+     = 0.3733               +  0.2529
+     = 0.6262
+```
 
 ---
 
