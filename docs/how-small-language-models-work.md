@@ -294,6 +294,65 @@ distillation loss = T² × KL( teacher at temperature T  ‖  student at tempera
 - **α (alpha)** sets the balance. α = 0 is ordinary training (hard labels only); α = 1 is pure
   imitation of the teacher. The script uses **T = 2, α = 0.5**.
 
+### Positions: one training text, many predictions
+
+The loss above is for **one position**. A training text produces many positions. Each position is
+the index of a token being *predicted*, from everything before it. Take `for i in range` as tokens
+(indexes start at 0):
+
+| position | context the model sees | hard label (what it should predict) |
+|---|---|---|
+| 1 | `for` | `␣i` |
+| 2 | `for i` | `␣in` |
+| 3 | `for i in` | `␣range` |
+
+- **There is no position 0.** Nothing comes before the first token, so nothing predicts it.
+- **The model's output after the last token isn't used.** It would predict the token after the
+  text ends, and there's nothing in the text to compare it with.
+- So a text of **n tokens gives n − 1 positions**. At each one, both models produce a full
+  probability list over the vocabulary, and the task, distillation and combined losses are calculated
+  exactly as above (Appendix A's logits example is position 3 in this table).
+- Positions count **tokens, not words**. The tokenizer often splits words into pieces and includes
+  the leading space (`␣range`).
+
+The losses are combined at each position and then averaged:
+
+```
+combined_k = (1 − α) × task_k + α × distill_k          at each position k
+loss       = average of combined_k over all positions
+```
+
+Because this is just weighted addition, averaging the combined losses gives the same number as
+averaging task and distillation separately and then mixing them with α. That's why the app can show
+the two averages side by side. (The real training script averages differently; see section 9.)
+
+**Teacher forcing: all positions in one pass.** The context at every position is always the **real**
+text, never the student's own guess. If the student predicts `␣x` at position 1, position 2 still
+sees `for i`. This is called **teacher forcing**. Because all inputs are known in advance, the whole
+text goes into the model **at once**, and one forward pass returns one probability list per position,
+a logits matrix of shape `[tokens, vocab size]`:
+
+```
+input:    for    ␣i     ␣in     ␣range    (
+           ↓      ↓      ↓        ↓       ↓
+output:   →␣i?   →␣in?  →␣range?  →(?    →10?     one row per position, all computed in parallel
+```
+
+Feeding every token in together doesn't let a position peek at its answer. The transformer's
+**causal mask** blocks each token from attending to any token after it, so row k is computed from
+tokens 0..k only, exactly as if the model had seen just that prefix.
+
+| | Training (teacher forcing) | Generation |
+|---|---|---|
+| Inputs | The real text, all known in advance | The model's own previous outputs |
+| Forward passes | 1 for the whole text | 1 per new token |
+| Parallel? | Yes, all positions at once | No, each token waits for the one before |
+
+This is the same split as reading the prompt vs writing in section 2: training on a 1,000-token text
+costs about as much as reading a 1,000-token prompt, while generating 1,000 tokens takes 1,000
+sequential passes. Speculative decoding (section 6) uses the same trick to check several drafted
+tokens in one pass.
+
 ### Part A: the loss on a real training example
 
 Training the 0.5B student for real needs a GPU (see "How the real training run works" below), so
