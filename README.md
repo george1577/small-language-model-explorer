@@ -125,9 +125,12 @@ int8 and NF4 weights. The original weights are restored afterwards.
    then adds one token (a correction, or a bonus if every draft matched).
 
 **What you see:** both speeds, the speed-up, the acceptance rate, whether the two outputs are
-identical, the output coloured by token origin (accepted / correction / bonus), a chart of accepted
-drafts per round, and a round inspector showing each draft's probability under both models and
-what the sampling rule `min(1, p/q)` would have done.
+identical, the output coloured by token origin (accepted / correction / bonus), and a round slider.
+Moving the slider outlines that round's tokens in the output, so you can see the text the target
+was given. Below it, the round's three steps: the draft's k guesses (made one after another), the
+target's k + 1 rows from its single pass (the prompt each row saw, the draft, the target's own pick
+including the bonus slot, and what the sampling rule `min(1, p/q)` would have done), and how many
+tokens the round added. A chart shows accepted drafts per round.
 
 ---
 

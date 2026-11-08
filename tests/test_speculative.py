@@ -1,5 +1,6 @@
 from slm_lab.speculative import (
-    count_accepted, sampling_acceptance_probability, speculative_generate, target_only_generate,
+    Round, count_accepted, round_starts, sampling_acceptance_probability, speculative_generate,
+    target_only_generate, verify_rows,
 )
 
 EOS = {99}
@@ -72,3 +73,35 @@ def test_stops_at_end_of_text():
 def test_sampling_acceptance_probability():
     assert sampling_acceptance_probability(0.6, 0.3) == 1.0
     assert sampling_acceptance_probability(0.2, 0.8) == 0.25
+
+
+def _round(drafted, preds, n):
+    return Round(drafted, [0.5] * len(drafted), preds, [0.5] * len(drafted), n, preds[n], 0.0, 0.0)
+
+
+def test_verify_rows_after_a_rejection():
+    rows = verify_rows(_round([10, 11, 12], [10, 20, 12, 13], 1))
+    assert [r.status for r in rows] == ["accepted", "rejected", "discarded", "unused"]
+    assert [r.kept for r in rows] == [True, True, False, False]
+    assert [r.drafted_before for r in rows] == [[], [10], [10, 11], [10, 11, 12]]
+    assert rows[-1].proposed is None and rows[-1].target_pick == 13
+
+
+def test_verify_rows_all_accepted_uses_the_bonus():
+    rows = verify_rows(_round([10, 11, 12], [10, 11, 12, 13], 3))
+    assert [r.status for r in rows] == ["accepted", "accepted", "accepted", "bonus"]
+    assert all(r.kept for r in rows)
+
+
+def test_verify_rows_first_draft_rejected_keeps_only_the_correction():
+    rows = verify_rows(_round([10, 11, 12], [20, 11, 12, 13], 0))
+    assert [r.status for r in rows] == ["rejected", "discarded", "discarded", "unused"]
+    assert [r.target_pick for r in rows if r.kept] == [20]
+
+
+def test_round_starts_follow_tokens_added():
+    spec = speculative_generate(make_propose(3), make_verify(), [3, 4], 3, 20, EOS)
+    starts = round_starts(spec.rounds)
+    assert starts[0] == 0
+    for i in range(1, len(starts)):
+        assert starts[i] == starts[i - 1] + len(spec.rounds[i - 1].added)

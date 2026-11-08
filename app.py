@@ -32,7 +32,7 @@ from slm_lab.quantization import (
     quantize,
     quantized_weights,
 )
-from slm_lab.speculative import sampling_acceptance_probability
+from slm_lab.speculative import round_starts, sampling_acceptance_probability, verify_rows
 from slm_lab.training_data import (
     GENERATION_SYSTEM,
     GENERATION_USER,
@@ -560,50 +560,128 @@ with tab5:
             "from one-at-a-time, which occasionally flips a near-tie. See the guide."
         )
 
-        st.markdown("**The output, coloured by where each token came from**")
-        spans = []
-        for i, rd in enumerate(s.rounds):
-            for t in rd.drafted[: rd.num_accepted]:
-                spans.append(("#c7f0c2", t, f"round {i + 1}: drafted and accepted"))
-            kind = "bonus (all drafts accepted)" if rd.num_accepted == len(rd.drafted) else "target's correction"
-            spans.append(("#cfe0ff" if rd.num_accepted == len(rd.drafted) else "#ffd9b3", rd.new_token, f"round {i + 1}: {kind}"))
-        spans = spans[: len(s.token_ids)]
-        body = "".join(
-            f'<span title="{html.escape(tip)}" style="background:{c};border-radius:3px;padding:1px 0;'
-            f'margin-right:1px">{html.escape(tgt.decode([t])).replace(chr(10), "⏎<br>")}</span>'
-            for c, t, tip in spans
-        )
-        st.markdown(f'<div style="line-height:1.9;font-family:monospace;color:#111">{body}</div>', unsafe_allow_html=True)
-        st.caption("🟩 drafted by the small model and accepted · 🟧 the target's correction at the first "
-                   "mismatch · 🟦 bonus token when all k drafts were accepted. Hover a token for its round.")
+        rounds = s.rounds
+        starts = round_starts(rounds)
+        GREEN, ORANGE, BLUE, RED = "#c7f0c2", "#ffd9b3", "#cfe0ff", "#ffc9c9"
 
-        acc = pd.DataFrame({"accepted drafts": [r.num_accepted for r in s.rounds]})
-        c1, c2 = st.columns([1, 2])
+        def chip(text: str, bg: str, style: str = "", tip: str = "") -> str:
+            t = f' title="{html.escape(tip)}"' if tip else ""
+            return (f'<span{t} style="background:{bg};color:#111;border-radius:3px;padding:1px 2px;'
+                    f'margin-right:1px;{style}">{html.escape(text)}</span>')
+
+        st.markdown("**Step through the rounds**")
+        rnum = st.slider("Round", 1, len(rounds), 1, key="s_round") if len(rounds) > 1 else 1
+        ri = rnum - 1
+        rd = rounds[ri]
+        ctx_ids = res.prompt_ids + s.token_ids[: starts[ri]]
+        added = s.token_ids[starts[ri]: starts[ri] + len(rd.added)]
+
+        # The whole text so far: prompt, earlier rounds (the current "prompt"), this round, later rounds.
+        spans = []
+        for i, r in enumerate(rounds):
+            for t in r.drafted[: r.num_accepted]:
+                spans.append((GREEN, t, f"round {i + 1}: drafted and accepted", i))
+            bonus = r.num_accepted == len(r.drafted)
+            spans.append((BLUE if bonus else ORANGE, r.new_token,
+                          f"round {i + 1}: {'bonus (all drafts accepted)' if bonus else 'target’s correction'}", i))
+        spans = spans[: len(s.token_ids)]
+        parts = [chip(tgt.decode(res.prompt_ids), "#e6e6e6", "color:#555", "the original prompt")]
+        marked = False
+        for c, t, tip, i in spans:
+            if i == ri and not marked:
+                parts.append('<b style="color:#e0245e">▶</b>')
+                marked = True
+            style = "outline:2px solid #e0245e;font-weight:bold" if i == ri else "opacity:0.25" if i > ri else ""
+            parts.append(chip(tgt.decode([t]), c, style, tip))
+        parts = [p.replace("\n", "⏎<br>") for p in parts]
+        st.markdown(f'<div style="line-height:2;font-family:monospace">{"".join(parts)}</div>',
+                    unsafe_allow_html=True)
+        st.caption(f"Round {rnum}: the target's **prompt** is the grey prompt plus everything before ▶ "
+                   f"({len(ctx_ids)} tokens). The outlined tokens are what this round added: **{len(added)} "
+                   f"token{'s' if len(added) != 1 else ''} for one target pass**. Faded tokens come from later "
+                   "rounds. 🟩 drafted and accepted · 🟧 the target's correction at the first mismatch · "
+                   "🟦 bonus token when all k drafts were accepted. Hover a token for its round.")
+
+        # Step 1: the draft writes k tokens, one after another.
+        rows = verify_rows(rd)
+        k = len(rd.drafted)
+        tail = visible(tgt.decode(ctx_ids))
+        tail_short = ("…" + tail[-60:]) if len(tail) > 60 else tail
+        lead_in = ("…" + tail[-25:]) if len(tail) > 25 else tail
+        strip = " → ".join([f'<span style="opacity:.6">{html.escape(lead_in)}</span>']
+                           + [chip(label(t), "#fff3b0") for t in rd.drafted])
+        st.markdown(f"**① Draft model: {k} guess{'es' if k != 1 else ''}, one after another** "
+                    f"({k} small pass{'es' if k != 1 else ''}; each guess needs the one before it)")
+        st.markdown(f'<div style="font-family:monospace;line-height:2">{strip}</div>', unsafe_allow_html=True)
+
+        # Step 2: the target checks all k + 1 rows in one pass.
+        st.markdown(f"**② Target model: checks all {k + 1} prompts in ONE pass, in parallel**")
+        result_text = {
+            "accepted": "✅ accepted (matches)",
+            "rejected": "❌ rejected → keep the target's pick (correction)",
+            "discarded": "– discarded: its prompt contains a rejected draft",
+            "bonus": "🟦 bonus: all drafts accepted → keep the target's pick",
+            "unused": "– unused: an earlier draft was rejected",
+        }
+        draft_bg = {"accepted": GREEN, "rejected": RED, "discarded": "#e6e6e6"}
+        pick_bg = {"accepted": GREEN, "rejected": ORANGE, "bonus": BLUE}
+
+        def prob_cell(x: float | None) -> str:
+            if x is None:
+                return ""
+            pct = round(100 * x)
+            return (f'<div style="background:linear-gradient(90deg,rgba(90,140,255,.35) {pct}%,transparent {pct}%);'
+                    f'padding:0 4px">{x:.3f}</div>')
+
+        td = 'style="padding:4px 8px;border-bottom:1px solid rgba(128,128,128,.25);vertical-align:middle"'
+        head = ["", "row", "prompt given to the target (its last tokens)", "draft proposed", "target's pick",
+                "result (greedy)", "draft prob q", "target prob of draft p", "sampling rule min(1, p/q)"]
+        trs = []
+        for j, row in enumerate(rows):
+            prompt_cell = (f'<span style="opacity:.6" title="{html.escape(tail)}">{html.escape(tail_short)}</span>'
+                           + "".join(chip(label(t), draft_bg[rows[m].status],
+                                          "text-decoration:line-through" if rows[m].status == "discarded" else "")
+                                     for m, t in enumerate(row.drafted_before)))
+            proposed = chip(label(row.proposed), "#fff3b0") if row.proposed is not None else \
+                '<span style="opacity:.6">— (no draft: bonus slot)</span>'
+            pick = chip(label(row.target_pick), pick_bg[row.status], "font-weight:bold") if row.kept else \
+                chip(label(row.target_pick), "#e6e6e6", "opacity:.6")
+            q = rd.draft_probs[j] if j < k else None
+            p = rd.target_probs[j] if j < k else None
+            rule = sampling_acceptance_probability(p, q) if j < k else None
+            lead = (f'<td rowspan="{k + 1}" style="padding:6px 10px;background:rgba(224,36,94,.08);'
+                    f'border-left:4px solid #e0245e;font-weight:bold;text-align:center;vertical-align:middle">'
+                    f'⚡ ONE<br>target<br>pass<br><span style="font-weight:normal;font-size:.85em">'
+                    f'{k + 1} rows<br>in parallel</span></td>') if j == 0 else ""
+            cells = [str(j + 1), prompt_cell, proposed, pick, result_text[row.status],
+                     prob_cell(q), prob_cell(p), prob_cell(rule)]
+            trs.append("<tr>" + lead + "".join(f"<td {td}>{c}</td>" for c in cells) + "</tr>")
+        th = 'style="padding:4px 8px;border-bottom:1px solid rgba(128,128,128,.5);text-align:left"'
+        ths = "".join(f"<th {th}>{h}</th>" for h in head)
+        st.markdown(f'<div style="overflow-x:auto"><table style="border-collapse:collapse;width:100%;'
+                    f'font-size:.9em"><thead><tr>{ths}</tr></thead><tbody>{"".join(trs)}</tbody></table></div>',
+                    unsafe_allow_html=True)
+
+        kind = "bonus" if rd.num_accepted == k else "correction"
+        st.markdown(
+            f"**③ Result:** {rd.num_accepted} accepted draft{'s' if rd.num_accepted != 1 else ''} + the target's "
+            f"{kind} `{label(rd.new_token)}` = **{len(added)} token{'s' if len(added) != 1 else ''} from 1 target "
+            f"pass**. The target alone would need {len(added)} pass{'es' if len(added) != 1 else ''}, one token at "
+            "a time, because each token's prompt includes the token before it."
+        )
+        st.caption("Row j's prompt is the text so far plus the first j−1 drafted tokens. The target can run all "
+                   "rows in one pass because the drafts are already known, and its causal mask stops each row "
+                   "from seeing the tokens after it. Rows after the first rejection were computed from text "
+                   "that will never exist, so they're thrown away. The last three columns show what the sampling "
+                   "version of speculative decoding would do (the app uses the greedy rule).")
+
+        acc = pd.DataFrame({"accepted drafts": [r.num_accepted for r in rounds]})
+        c1, _ = st.columns([1, 2])
         c1.markdown("**Accepted drafts per round**")
         c1.altair_chart(alt.Chart(acc).mark_bar().encode(alt.X("accepted drafts:O"), alt.Y("count()", title="rounds")),
                         width="stretch")
-        c1.caption(f"Each round adds accepted + 1 tokens. Draft time {sum(r.draft_seconds for r in s.rounds):.1f} s, "
-                   f"target time {sum(r.target_seconds for r in s.rounds):.1f} s in total.")
-        with c2:
-            st.markdown("**Inspect a round**")
-            rnum = st.slider("Round", 1, len(s.rounds), 1, key="s_round") if len(s.rounds) > 1 else 1
-            rd = s.rounds[rnum - 1]
-            rows = []
-            for j, t in enumerate(rd.drafted):
-                status = "✅ accepted" if j < rd.num_accepted else ("❌ rejected" if j == rd.num_accepted else "– discarded (after a rejection)")
-                rows.append({
-                    "position": j + 1, "draft proposed": label(t), "draft prob q": rd.draft_probs[j],
-                    "target's own pick": label(rd.target_preds[j]), "target prob of draft p": rd.target_probs[j],
-                    "result (greedy)": status,
-                    "sampling rule min(1, p/q)": sampling_acceptance_probability(rd.target_probs[j], rd.draft_probs[j]),
-                })
-            st.dataframe(pd.DataFrame(rows), column_config={
-                "draft prob q": PROB, "target prob of draft p": PROB, "sampling rule min(1, p/q)": PROB},
-                hide_index=True, width="stretch")
-            st.caption(f"Then the target adds its own token **`{label(rd.new_token)}`** "
-                       f"({'bonus' if rd.num_accepted == len(rd.drafted) else 'correction'}). "
-                       "The last column shows the probability the sampling version of speculative decoding "
-                       "would accept the draft with (the app uses the greedy rule).")
+        c1.caption(f"Each round adds accepted + 1 tokens. Draft time {sum(r.draft_seconds for r in rounds):.1f} s, "
+                   f"target time {sum(r.target_seconds for r in rounds):.1f} s in total.")
         st.caption("On a laptop CPU the speed-up is smaller than on a GPU: a CPU pays more per extra token "
                    "checked, and the draft model here is a third of the target's size (the script's is about "
                    "a seventh). Timings on a busy laptop are noisy, so run it twice before drawing conclusions. "

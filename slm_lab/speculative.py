@@ -53,6 +53,49 @@ class DecodeResult:
         return sum(r.num_accepted for r in self.rounds) / drafted if drafted else 0.0
 
 
+@dataclass
+class VerifyRow:
+    """One of the k + 1 predictions the target makes in a round's single verify pass."""
+    drafted_before: list[int]     # drafted tokens appended to the round's context for this row
+    proposed: int | None          # the drafted token this row checks; None for the bonus row
+    target_pick: int              # the target's own greedy choice given that context
+    status: str                   # accepted | rejected | discarded | bonus | unused
+    kept: bool                    # whether target_pick ends up in the output
+
+
+def verify_rows(rd: Round) -> list[VerifyRow]:
+    """Lay out a round's verify pass row by row: row j predicts the token after context + drafted[:j].
+
+    All rows come from one target forward pass. Rows after the first rejection are computed from a
+    context containing the rejected token, so they are thrown away. The last row (the bonus) is only
+    used when every drafted token was accepted.
+    """
+    k, n = len(rd.drafted), rd.num_accepted
+    rows = []
+    for j in range(k + 1):
+        if j < k:
+            status = "accepted" if j < n else ("rejected" if j == n else "discarded")
+        else:
+            status = "bonus" if n == k else "unused"
+        rows.append(VerifyRow(
+            drafted_before=rd.drafted[:j],
+            proposed=rd.drafted[j] if j < k else None,
+            target_pick=rd.target_preds[j],
+            status=status,
+            kept=j <= n,
+        ))
+    return rows
+
+
+def round_starts(rounds: list[Round]) -> list[int]:
+    """Offset into the generated tokens where each round's tokens begin."""
+    starts, pos = [], 0
+    for rd in rounds:
+        starts.append(pos)
+        pos += len(rd.added)
+    return starts
+
+
 def count_accepted(drafted: list[int], target_preds: list[int]) -> int:
     """Greedy acceptance: accept drafted tokens from the left until the first mismatch."""
     n = 0

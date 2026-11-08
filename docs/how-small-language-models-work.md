@@ -639,6 +639,66 @@ sequenceDiagram
     Note over D,T: Text so far: "... located in the south" (2 tokens for 1 target pass)
 ```
 
+### Round by round: who does what
+
+Each round has three steps, and the two models work very differently in them.
+
+1. **The draft writes k guesses, one after another.** Each guess needs the one before it, so this is
+   k small passes in a row.
+2. **The target checks them in ONE pass.** It runs on k + 1 prompts at once: the text so far, then
+   the text plus 1 draft, plus 2 drafts, …, plus all k. Every input is already known, so all k + 1
+   predictions come out of a single forward pass, computed in parallel. The causal mask stops each
+   row from seeing the tokens after it, as with teacher forcing in section 4.
+3. **Keep drafts from the left while they match the target's pick, then add one target token.** At
+   the first mismatch, the target's pick on that row replaces the draft (a **correction**). If all k
+   drafts match, the last row's pick is added for free (the **bonus**). Rows after a mismatch are
+   thrown away even if they agree, because their prompt contains the rejected draft: they predict
+   text that will never exist.
+
+A real run from the app, prompt `The future of AI is`, k = 3:
+
+**Round 1.** The draft writes `␣in` → `␣the` → `␣hands` (3 small passes). The target then runs one pass
+over 4 rows:
+
+| row | prompt given to the target | draft proposed | target's pick | result |
+|---|---|---|---|---|
+| 1 | `The future of AI is` | `␣in` | `␣bright` | ❌ rejected → keep `␣bright` (correction) |
+| 2 | `The future of AI is in` | `␣the` | `␣the` | discarded (its prompt contains `␣in`) |
+| 3 | `The future of AI is in the` | `␣hands` | `␣hands` | discarded |
+| 4 | `The future of AI is in the hands` | (bonus slot) | `␣of` | unused (a draft was rejected) |
+
+Rows 2 and 3 agree with the draft, but it doesn't matter: once `␣in` is rejected, everything computed
+after it is thrown away. The round adds **1 token** (`␣bright`) for 1 target pass. That's no worse
+than the target alone; the only cost is the time the draft spent on its 3 guesses.
+
+**Round 2.** The prompt is now `The future of AI is bright`. The draft writes `,` → `␣but` → `␣it`:
+
+| row | prompt given to the target | draft proposed | target's pick | result |
+|---|---|---|---|---|
+| 1 | `The future of AI is bright` | `,` | `,` | ✅ accepted |
+| 2 | `The future of AI is bright,` | `␣but` | `␣but` | ✅ accepted |
+| 3 | `The future of AI is bright, but` | `␣it` | `␣it` | ✅ accepted |
+| 4 | `The future of AI is bright, but it` | (bonus slot) | `’s` | 🟦 bonus: kept |
+
+All three drafts match, so the bonus `’s` is kept too. The round adds **4 tokens for 1 target pass**;
+the target alone would have needed 4 passes, one token at a time. The prompt for round 3 is
+`The future of AI is bright, but it’s`.
+
+In general:
+
+```
+tokens added per round = (drafts accepted from the left) + 1 target token
+                       = between 1 (first draft wrong) and k + 1 (all drafts right)
+```
+
+Every round costs one target pass and adds at least one token, so speculative decoding never needs
+more target passes than the target alone. And every token kept is one the target picked itself.
+
+The tab shows exactly this. Move the **Round** slider and the output above it outlines that round's
+tokens: everything before the ▶ is the prompt the target was given, and later rounds are faded. Below
+it, the round is laid out as the three steps, with all k + 1 target rows (including the bonus slot)
+grouped under one "⚡ ONE target pass" band.
+
 ### Why the output is exactly the target's
 
 The app accepts a draft only if it is **exactly** the token the target would have picked with greedy
@@ -669,7 +729,8 @@ Another good one: for `The cathedral of Notre Dame is known for its`, the draft 
 `␣stained` had 15% probability; the target gave it only 2%. Rounds like that gain just 1 token each.
 
 The tab colours each output token by origin: 🟩 drafted and accepted, 🟧 the target's correction,
-🟦 a bonus token.
+🟦 a bonus token. In the round view, rejected drafts inside a row's prompt are red and discarded ones
+are struck through.
 
 ### What about sampling? The `min(1, p/q)` rule
 
@@ -684,7 +745,7 @@ top token?" doesn't make sense, and the rule becomes probabilistic:
 
 This clever rule guarantees the output has *exactly the same probability distribution* as sampling
 from the target alone. The round inspector in the tab shows p, q and min(1, p/q) for every drafted
-token. In round 1 above, `␣the` had q = 0.62, p = 0.59, so it would be accepted with probability 95%.
+token. In round 1 of the Black Forest example above, `␣the` had q = 0.62, p = 0.59, so it would be accepted with probability 95%.
 `␣central` had q = 0.05, p = 0.02, so it would be accepted with probability only 40%.
 
 (The p values *after* the first rejection are computed from a context the target already rejected,
